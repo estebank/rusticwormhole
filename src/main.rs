@@ -23,7 +23,9 @@ struct Opts {
 #[derive(Clap, Debug)]
 enum Flavor {
     Send(SendTo),
-    Receive,
+    Receive {
+        port: usize,
+    },
     Registry,
 }
 
@@ -46,7 +48,7 @@ async fn main() -> Result<(), Error> {
     println!("{:?}", opts);
     match opts.flavor {
         Flavor::Send(target) => send(&target, &opts.username).await?,
-        Flavor::Receive => receive().await?,
+        Flavor::Receive { port } => receive(&opts.username, port).await?,
         Flavor::Registry => registry().await.unwrap(),
     }
     Ok(())
@@ -66,13 +68,14 @@ async fn send(target: &SendTo, username: &str) -> Result<(), Error> {
     if !target.path.exists() {
         panic!("{} doesn't exist", target.path.display());
     }
+    let res = surf::get(format!("http://{}", REGISTRY));//.await.map_err(map_err)?;
+
+    let map: Map = surf::client().recv_json(res).await.map_err(map_err)?;
+    println!("{:?}", map);
+    // println!("{:?}", res.recv_json().await.map_err(map_err));
     let mut file = File::open(&target.path).await?;
 
-    let mut users: HashMap<&str, SocketAddr> = HashMap::new();
-    users.insert("foo", SocketAddr::from(([127, 0, 0, 1], 8000)));
-    users.insert("bar", SocketAddr::from(([127, 0, 0, 1], 8001)));
-
-    let mut stream = TcpStream::connect(users[target.name.as_str()]).await?;
+    let mut stream = TcpStream::connect(&map.0[target.name.as_str()]).await?;
     stream.write(username.as_bytes()).await?;
     stream.write(":".as_bytes()).await?;
     stream.write(target.path.to_string_lossy().as_bytes()).await?;
@@ -87,9 +90,17 @@ async fn send(target: &SendTo, username: &str) -> Result<(), Error> {
     Ok(())
 }
 
-async fn receive() -> Result<(), Error> {
+fn map_err<T: std::fmt::Debug>(e: T) -> Error{ 
+        println!("{:?}", e);
+        Error
+}
 
-    let listener = TcpListener::bind("127.0.0.1:8000").await?;
+async fn receive(username: &str, port: usize) -> Result<(), Error> {
+
+    // FIX TARGET
+    let res = surf::get(&format!("http://{}/register?username={}&target={}:{}", REGISTRY, username, "127.0.0.1", port)).await.map_err(map_err)?;
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     let mut incoming = listener.incoming();
     let target_dir: PathBuf = "received_files".into();
     create_dir_all(&target_dir).await?;
@@ -148,6 +159,9 @@ struct State {
     registry: Arc<Mutex<HashMap<String, String>>>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct Map(HashMap<String, String>);
+
 impl State {
     fn register(&self, mapping: Mapping) {
         let r = self.registry.lock();
@@ -159,7 +173,7 @@ impl State {
 unsafe impl Send for State {}
 unsafe impl Sync for State {}
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Debug)]
 #[serde(default)]
 struct Mapping {
     username: Option<String>,
@@ -171,17 +185,21 @@ async fn registry() -> tide::Result<()> {
     let mut app = tide::with_state(registry);
     app.at("/").get(|req: Request<State>| {
         async move {
-            println!("hi");
             let r = req.state().registry.lock();
             let r = r.unwrap();
-            let x = r.get(req.url().as_str()).clone();
-            Ok(format!("{:?}", x))
+            // let x = r.get(req.url().as_str()).clone();
+            let mut res = tide::Response::new(200);
+            let map = Map(r.clone()); // FIXME: don't do this
+            res.set_body(tide::Body::from_json(&map)?);
+            Ok(res)
         }
     });
-    app.at("/").post(|req: Request<State>| {
+    app.at("/register").get(|req: Request<State>| {
+        // FIXME: This should be POST not GET
         async move {
             let state  = req.state();
-            let mapping: Mapping = req.query()?;
+            let mut mapping: Mapping = req.query()?;
+            println!("mapping {:?}", mapping);
             state.register(mapping);
             Ok("ok")
         }
