@@ -23,6 +23,7 @@ struct Opts {
 #[derive(Clap, Debug)]
 enum Flavor {
     Send(SendTo),
+    List,
     Receive {
         port: usize,
     },
@@ -48,6 +49,7 @@ async fn main() -> Result<(), Error> {
     println!("{:?}", opts);
     match opts.flavor {
         Flavor::Send(target) => send(&target, &opts.username).await?,
+        Flavor::List => list().await?,
         Flavor::Receive { port } => receive(&opts.username, port).await?,
         Flavor::Registry => registry().await.unwrap(),
     }
@@ -62,6 +64,15 @@ impl<E: std::error::Error> From<E> for Error {
         println!("{:?}", e);
         Error
     }
+}
+
+async fn list() -> Result<(), Error> {
+    let res = surf::get(format!("http://{}", REGISTRY));
+    let map: Map = surf::client().recv_json(res).await.map_err(map_err)?;
+    for username in map.0.keys() {
+        println!("{}", username);
+    }
+    Ok(())
 }
 
 async fn send(target: &SendTo, username: &str) -> Result<(), Error> {
@@ -198,7 +209,7 @@ async fn registry() -> tide::Result<()> {
         // FIXME: This should be POST not GET
         async move {
             let state  = req.state();
-            let mut mapping: Mapping = req.query()?;
+            let mapping: Mapping = req.query()?;
             println!("mapping {:?}", mapping);
             state.register(mapping);
             Ok("ok")
