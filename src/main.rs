@@ -88,6 +88,11 @@ async fn send(username: &str, target: &str, path: PathBuf) -> Result<(), Error> 
     stream.write(username.as_bytes()).await?;
     stream.write(":".as_bytes()).await?;
     stream.write(path.to_string_lossy().as_bytes()).await?;
+    let mut go_ahead = vec![0];
+    stream.read(&mut go_ahead).await?;
+    if go_ahead[0] != 1 {
+        panic!("rejected");
+    }
 
     let mut contents = vec![0; BUF_SIZE];
     loop {
@@ -140,9 +145,11 @@ async fn receive(username: &str, port: usize) -> Result<(), Error> {
             stdin.read_line(&mut line).await?;
             if line.trim().to_ascii_lowercase() == "n" {
                 println!("rejecting");
+                stream.write(&[0]).await?;
                 continue 'outer;
             } else if line.trim().to_ascii_lowercase() == "y" {
                 println!("accepting");
+                stream.write(&[1]).await?;
                 break;
             }
         }
@@ -202,7 +209,6 @@ async fn registry() -> tide::Result<()> {
         async move {
             let r = req.state().registry.lock();
             let r = r.unwrap();
-            // let x = r.get(req.url().as_str()).clone();
             let mut res = tide::Response::new(200);
             let map = Map(r.clone()); // FIXME: don't do this
             res.set_body(tide::Body::from_json(&map)?);
