@@ -29,6 +29,7 @@ enum Flavor {
     Receive {
         username: String,
         port: usize,
+        target_dir: Option<PathBuf>,
     },
     Registry,
 }
@@ -49,7 +50,18 @@ async fn main() -> Result<(), Error> {
             path,
         } => send(&username, &target, path).await?,
         Flavor::List => list().await?,
-        Flavor::Receive { username, port } => receive(&username, port).await?,
+        Flavor::Receive {
+            username,
+            port,
+            target_dir,
+        } => {
+            receive(
+                &username,
+                port,
+                target_dir.unwrap_or("received_files".into()),
+            )
+            .await?
+        }
         Flavor::Registry => registry().await.unwrap(),
     }
     Ok(())
@@ -110,7 +122,7 @@ fn map_err<T: std::fmt::Debug>(e: T) -> Error {
     Error
 }
 
-async fn receive(username: &str, port: usize) -> Result<(), Error> {
+async fn receive(username: &str, port: usize, target_dir: PathBuf) -> Result<(), Error> {
     // FIXME: Use POST instead of GET
     let _res = surf::get(&format!(
         "http://{}/register?username={}&target={}:{}",
@@ -121,7 +133,6 @@ async fn receive(username: &str, port: usize) -> Result<(), Error> {
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     let mut incoming = listener.incoming();
-    let target_dir: PathBuf = "received_files".into();
     create_dir_all(&target_dir).await?;
 
     'outer: while let Some(stream) = incoming.next().await {
