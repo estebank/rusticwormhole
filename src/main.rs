@@ -1,15 +1,14 @@
+use async_std::fs::{create_dir_all, File};
+use async_std::net::{TcpListener, TcpStream};
+use async_std::prelude::*;
 use clap::Clap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use async_std::net::{TcpStream, TcpListener};
-use async_std::prelude::*;
-use async_std::fs::{File, create_dir_all};
-use tide::Request;
-use tide::prelude::*;
 use std::sync::Arc;
 use std::sync::Mutex;
-
+use tide::prelude::*;
+use tide::Request;
 
 /// Magic Wormhole clone
 #[derive(Clap, Debug)]
@@ -17,25 +16,22 @@ use std::sync::Mutex;
 struct Opts {
     #[clap(subcommand)]
     flavor: Flavor,
-    username: String,
 }
 
 #[derive(Clap, Debug)]
 enum Flavor {
-    Send(SendTo),
+    Send {
+        username: String,
+        target: String,
+        path: PathBuf,
+    },
     List,
     Receive {
+        username: String,
         port: usize,
     },
     Registry,
 }
-
-#[derive(Clap, Debug)]
-struct SendTo {
-    name: String,
-    path: PathBuf,
-}
-
 
 const BUF_SIZE: usize = 1024;
 const REGISTRY: &'static str = "127.0.0.1:9999";
@@ -46,11 +42,14 @@ async fn main() -> Result<(), Error> {
     let mut users: HashMap<&str, SocketAddr> = HashMap::new();
     users.insert("foo", SocketAddr::from(([127, 0, 0, 1], 8000)));
     users.insert("bar", SocketAddr::from(([127, 0, 0, 1], 8001)));
-    println!("{:?}", opts);
     match opts.flavor {
-        Flavor::Send(target) => send(&target, &opts.username).await?,
+        Flavor::Send {
+            username,
+            target,
+            path,
+        } => send(&username, &target, path).await?,
         Flavor::List => list().await?,
-        Flavor::Receive { port } => receive(&opts.username, port).await?,
+        Flavor::Receive { username, port } => receive(&username, port).await?,
         Flavor::Registry => registry().await.unwrap(),
     }
     Ok(())
@@ -69,47 +68,51 @@ impl<E: std::error::Error> From<E> for Error {
 async fn list() -> Result<(), Error> {
     let res = surf::get(format!("http://{}", REGISTRY));
     let map: Map = surf::client().recv_json(res).await.map_err(map_err)?;
+    println!("Currently registered users:\n");
     for username in map.0.keys() {
         println!("{}", username);
     }
     Ok(())
 }
 
-async fn send(target: &SendTo, username: &str) -> Result<(), Error> {
-    if !target.path.exists() {
-        panic!("{} doesn't exist", target.path.display());
+async fn send(username: &str, target: &str, path: PathBuf) -> Result<(), Error> {
+    if !path.exists() {
+        panic!("{} doesn't exist", path.display());
     }
-    let res = surf::get(format!("http://{}", REGISTRY));//.await.map_err(map_err)?;
+    let res = surf::get(format!("http://{}", REGISTRY));
 
     let map: Map = surf::client().recv_json(res).await.map_err(map_err)?;
-    println!("{:?}", map);
-    // println!("{:?}", res.recv_json().await.map_err(map_err));
-    let mut file = File::open(&target.path).await?;
+    let mut file = File::open(&path).await?;
 
-    let mut stream = TcpStream::connect(&map.0[target.name.as_str()]).await?;
+    let mut stream = TcpStream::connect(&map.0[target]).await?;
     stream.write(username.as_bytes()).await?;
     stream.write(":".as_bytes()).await?;
-    stream.write(target.path.to_string_lossy().as_bytes()).await?;
+    stream.write(path.to_string_lossy().as_bytes()).await?;
 
     let mut contents = vec![0; BUF_SIZE];
     loop {
         let n = file.read(&mut contents).await?;
-        if n == 0 { break; }
-        println!("read {:?} {:?}", target.path, contents);
+        if n == 0 {
+            break;
+        }
         stream.write(&contents[0..n]).await?;
     }
     Ok(())
 }
 
-fn map_err<T: std::fmt::Debug>(e: T) -> Error{ 
-        println!("{:?}", e);
-        Error
+fn map_err<T: std::fmt::Debug>(e: T) -> Error {
+    println!("{:?}", e);
+    Error
 }
 
 async fn receive(username: &str, port: usize) -> Result<(), Error> {
-
-    // FIX TARGET
-    let res = surf::get(&format!("http://{}/register?username={}&target={}:{}", REGISTRY, username, "127.0.0.1", port)).await.map_err(map_err)?;
+    // FIXME: Use POST instead of GET
+    let _res = surf::get(&format!(
+        "http://{}/register?username={}&target={}:{}",
+        REGISTRY, username, "127.0.0.1", port
+    ))
+    .await
+    .map_err(map_err)?;
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     let mut incoming = listener.incoming();
@@ -126,9 +129,8 @@ async fn receive(username: &str, port: usize) -> Result<(), Error> {
             break;
         }
         let header = std::str::from_utf8(&contents[..n])?;
-        println!("{:?}", header);
         let pos = header.find(':').unwrap();
-        let file_name = &header[pos+1..];
+        let file_name = &header[pos + 1..];
         let username = &header[..pos];
         println!("incoming file `{}` from {}", file_name, username);
         loop {
@@ -156,9 +158,11 @@ async fn receive(username: &str, port: usize) -> Result<(), Error> {
         println!("writing");
         loop {
             let n = stream.read(&mut contents).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             let _ = file.write(&contents[..n]).await?;
-            print!("{}", std::str::from_utf8(&contents[..n])?);
+            print!(".");
         }
         println!("");
     }
@@ -208,7 +212,7 @@ async fn registry() -> tide::Result<()> {
     app.at("/register").get(|req: Request<State>| {
         // FIXME: This should be POST not GET
         async move {
-            let state  = req.state();
+            let state = req.state();
             let mapping: Mapping = req.query()?;
             println!("mapping {:?}", mapping);
             state.register(mapping);
