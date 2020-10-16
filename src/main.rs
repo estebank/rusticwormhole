@@ -113,7 +113,9 @@ async fn send(username: &str, target: &str, path: PathBuf) -> Result<(), Error> 
             break;
         }
         stream.write(&contents[0..n]).await?;
+        print!(".");
     }
+    println!("");
     Ok(())
 }
 
