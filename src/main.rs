@@ -43,7 +43,7 @@ enum Flavor {
 }
 
 /// Size of the send/receive buffers.
-const BUF_SIZE: usize = 1024;
+const BUF_SIZE: usize = 1024 * 1024 * 10;
 
 #[async_std::main]
 async fn main() -> Result<(), Error> {
