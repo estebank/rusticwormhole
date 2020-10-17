@@ -1,6 +1,7 @@
 use async_std::fs::{create_dir_all, File};
 use async_std::net::{TcpListener, TcpStream};
 use async_std::prelude::*;
+use async_std::task;
 use clap::Clap;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -114,34 +115,41 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
     let mut file = File::open(&path).await?;
 
     let mut stream = TcpStream::connect(&map.0[target]).await?;
-    // let end = file.seek(async_std::io::SeekFrom::End(0)).await?;
-    let header = format!("{}:{}:{}", username, "0", path.to_string_lossy());
+    let end = file.seek(async_std::io::SeekFrom::End(0)).await?;
+    let header = format!("{}:{}:{}", username, end, path.to_string_lossy());
     stream.write(header.as_bytes()).await?;
 
-    // let _ = file.seek(async_std::io::SeekFrom::Start(0)).await?;
+    let _ = file.seek(async_std::io::SeekFrom::Start(0)).await?;
     let mut go_ahead = vec![0];
     stream.read(&mut go_ahead).await?;
     if go_ahead[0] != 1 {
         panic!("rejected");
     }
 
-    let mut contents = vec![0; BUF_SIZE];
+    let mut contents = vec![0; 1024]; //BUF_SIZE];
+    let mut total = 0;
     loop {
         let n = file.read(&mut contents).await?;
+        stream.write(&contents[0..n]).await?;
+        stream.flush().await?;
+        print!(".");
+        total += n;
         if n == 0 {
             break;
         }
-        stream.write(&contents[0..n]).await?;
-        print!(".");
     }
-    stream.flush();
-    println!("");
+    println!("total {}", total);
     Ok(())
 }
 
 /// Set up a receiver service. It can only handle one file at a time because we don't negotiate a
 /// new port for each new incomming connection.
-async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &str) -> Result<(), Error> {
+async fn receive(
+    username: &str,
+    port: usize,
+    target_dir: PathBuf,
+    registry: &str,
+) -> Result<(), Error> {
     // FIXME: Use POST instead of GET
     let _res = surf::get(&format!(
         "http://{}/register?username={}&target={}",
@@ -154,22 +162,35 @@ async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &st
     let mut incoming = listener.incoming();
     create_dir_all(&target_dir).await?;
 
-    'outer: while let Some(stream) = incoming.next().await {
-        let mut contents = vec![0; BUF_SIZE];
-        let mut stream = stream?;
+    while let Some(stream) = incoming.next().await {
+        let stream = stream?;
+        let target_dir = target_dir.clone();
+        task::spawn(async move { process(stream, target_dir).await });
+    }
+    Ok(())
+}
 
+async fn process(mut stream: TcpStream, target_dir: PathBuf) -> Result<(), Error> {
+    {
+        let mut contents = vec![0; BUF_SIZE];
         let n = stream.read(&mut contents).await?;
         if n == 0 {
             println!("username and path missing?");
-            break;
+            return Ok(());
         }
         let header = std::str::from_utf8(&contents[..n])?.to_string();
         let header = header.split(':').collect::<Vec<_>>();
         let (username, file_len, file_name) = match &header[..] {
-            [username, file_len, file_name] => (username, file_len, file_name),
+            [username, file_len, file_name] => {
+                let file_len: Result<usize, _> = file_len.parse();
+                (username, file_len.unwrap(), file_name)
+            }
             _ => panic!(),
         };
-        println!("incoming file `{}` from {} with len {}", file_name, username, file_len);
+        println!(
+            "incoming file `{}` from `{}` with len {}",
+            file_name, username, file_len
+        );
         loop {
             println!("accept? y/n");
             let stdin = async_std::io::stdin();
@@ -178,7 +199,7 @@ async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &st
             if line.trim().to_ascii_lowercase() == "n" {
                 println!("rejecting");
                 stream.write(&[0]).await?;
-                continue 'outer;
+                return Ok(());
             } else if line.trim().to_ascii_lowercase() == "y" {
                 println!("accepting");
                 stream.write(&[1]).await?;
@@ -186,7 +207,7 @@ async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &st
             }
         }
 
-        let mut path = target_dir.clone();
+        let mut path: PathBuf = target_dir.into();
         path.push(file_name);
         // Maintain directory structure
         create_dir_all(&path.parent().unwrap()).await?;
@@ -194,16 +215,19 @@ async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &st
         // TODO file already exists?
         println!("writing to {:?}", path.display());
         let mut file = File::create(&path).await?;
+        let mut total = 0;
         loop {
             let n = stream.read(&mut contents).await?;
-            if n == 0 {
+            async_std::io::copy(&contents[..n], &mut file).await?;
+            print!(".");
+
+            total += n;
+            println!("total {}", total);
+            if total == file_len {
                 break;
             }
-            let _ = file.write(&contents[..n]).await?;
-            print!(".");
         }
-        file.flush();
-        println!("");
+        println!("total {}", total);
     }
     Ok(())
 }
@@ -254,7 +278,13 @@ async fn registry(reg: &str) -> tide::Result<()> {
         async move {
             let state = req.state();
             let mut mapping: Mapping = req.query()?;
-            mapping.target = mapping.target.map(|port| format!("{}:{}", req.remote().unwrap().split(":").next().unwrap(), port));
+            mapping.target = mapping.target.map(|port| {
+                format!(
+                    "{}:{}",
+                    req.remote().unwrap().split(":").next().unwrap(),
+                    port
+                )
+            });
             println!("mapping {:?}", mapping);
             state.register(mapping);
             Ok("ok")
