@@ -114,11 +114,11 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
     let mut file = File::open(&path).await?;
 
     let mut stream = TcpStream::connect(&map.0[target]).await?;
-    let end = file.seek(async_std::io::SeekFrom::End(0)).await?;
-    let header = format!("{}:{}:{}", username, end, path.to_string_lossy());
+    // let end = file.seek(async_std::io::SeekFrom::End(0)).await?;
+    let header = format!("{}:{}:{}", username, "0", path.to_string_lossy());
     stream.write(header.as_bytes()).await?;
 
-    let _ = file.seek(async_std::io::SeekFrom::Start(0)).await?;
+    // let _ = file.seek(async_std::io::SeekFrom::Start(0)).await?;
     let mut go_ahead = vec![0];
     stream.read(&mut go_ahead).await?;
     if go_ahead[0] != 1 {
