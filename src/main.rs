@@ -114,9 +114,11 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
     let mut file = File::open(&path).await?;
 
     let mut stream = TcpStream::connect(&map.0[target]).await?;
-    stream.write(username.as_bytes()).await?;
-    stream.write(":".as_bytes()).await?;
-    stream.write(path.to_string_lossy().as_bytes()).await?;
+    let end = file.seek(async_std::io::SeekFrom::End(0)).await?;
+    let header = format!("{}:{}:{}", username, end, path.to_string_lossy());
+    stream.write(header.as_bytes()).await?;
+
+    let _ = file.seek(async_std::io::SeekFrom::Start(0)).await?;
     let mut go_ahead = vec![0];
     stream.read(&mut go_ahead).await?;
     if go_ahead[0] != 1 {
@@ -147,7 +149,7 @@ async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &st
     .await
     .map_err(map_err)?;
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     let mut incoming = listener.incoming();
     create_dir_all(&target_dir).await?;
 
@@ -160,11 +162,13 @@ async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &st
             println!("username and path missing?");
             break;
         }
-        let header = std::str::from_utf8(&contents[..n])?;
-        let pos = header.find(':').unwrap();
-        let file_name = &header[pos + 1..];
-        let username = &header[..pos];
-        println!("incoming file `{}` from {}", file_name, username);
+        let header = std::str::from_utf8(&contents[..n])?.to_string();
+        let header = header.split(':').collect::<Vec<_>>();
+        let (username, file_len, file_name) = match &header[..] {
+            [username, file_len, file_name] => (username, file_len, file_name),
+            _ => panic!(),
+        };
+        println!("incoming file `{}` from {} with len {}", file_name, username, file_len);
         loop {
             println!("accept? y/n");
             let stdin = async_std::io::stdin();
