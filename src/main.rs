@@ -117,7 +117,7 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
     let mut stream = TcpStream::connect(&map.0[target]).await?;
     let end = file.seek(async_std::io::SeekFrom::End(0)).await?;
     let header = format!("{}:{}:{}", username, end, path.to_string_lossy());
-    stream.write(header.as_bytes()).await?;
+    stream.write_all(header.as_bytes()).await?;
 
     let _ = file.seek(async_std::io::SeekFrom::Start(0)).await?;
     let mut go_ahead = vec![0];
@@ -126,11 +126,11 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
         panic!("rejected");
     }
 
-    let mut contents = vec![0; 1024]; //BUF_SIZE];
+    let mut contents = vec![0; BUF_SIZE];
     let mut total = 0;
     loop {
         let n = file.read(&mut contents).await?;
-        stream.write(&contents[0..n]).await?;
+        stream.write_all(&contents[0..n]).await?;
         stream.flush().await?;
         print!(".");
         total += n;
@@ -216,18 +216,21 @@ async fn process(mut stream: TcpStream, target_dir: PathBuf) -> Result<(), Error
         println!("writing to {:?}", path.display());
         let mut file = File::create(&path).await?;
         let mut total = 0;
+        let mut consecutive_zeros = 0;
         loop {
             let n = stream.read(&mut contents).await?;
             async_std::io::copy(&contents[..n], &mut file).await?;
             print!(".");
 
             total += n;
-            println!("total {}", total);
-            if total == file_len {
+            if total == file_len || consecutive_zeros > 1000 {
                 break;
             }
+            if n == 0 {
+                consecutive_zeros += 1;
+            }
         }
-        println!("total {}", total);
+        println!("total {} of {}", total, file_len);
     }
     Ok(())
 }
