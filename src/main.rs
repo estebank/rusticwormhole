@@ -134,6 +134,7 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
         stream.write(&contents[0..n]).await?;
         print!(".");
     }
+    stream.flush();
     println!("");
     Ok(())
 }
@@ -191,9 +192,8 @@ async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &st
         create_dir_all(&path.parent().unwrap()).await?;
 
         // TODO file already exists?
+        println!("writing to {:?}", path.display());
         let mut file = File::create(&path).await?;
-
-        println!("writing");
         loop {
             let n = stream.read(&mut contents).await?;
             if n == 0 {
@@ -202,6 +202,7 @@ async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &st
             let _ = file.write(&contents[..n]).await?;
             print!(".");
         }
+        file.flush();
         println!("");
     }
     Ok(())
