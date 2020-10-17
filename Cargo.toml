@@ -12,3 +12,4 @@ async-std = { version = "1.6.5", features = ["attributes"] }
 tide = "0.13.0"
 serde = "*"
 surf = "2.0.0"
+async-tls = "0.8"
