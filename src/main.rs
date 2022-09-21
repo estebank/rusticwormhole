@@ -1,18 +1,22 @@
-use async_std::fs::{create_dir_all, File};
-use async_std::net::{TcpListener, TcpStream};
-use async_std::prelude::*;
-use async_std::task;
-use clap::Clap;
+use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::error::Error;
+use std::io::Read;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tide::prelude::*;
-use tide::Request;
+use tokio::fs::{create_dir_all, File};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use warp::{Buf, Filter};
+
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 /// Magic Wormhole clone
-#[derive(Clap, Debug)]
-#[clap(version = "0.1")]
+#[derive(Debug, Parser)]
+#[clap(version = "0.2")]
 struct Opts {
     #[clap(long, default_value = "0.0.0.0:9999")]
     registry: String,
@@ -20,7 +24,7 @@ struct Opts {
     flavor: Flavor,
 }
 
-#[derive(Clap, Debug)]
+#[derive(Debug, Subcommand)]
 enum Flavor {
     /// Send a local file to a registered receiver
     Send {
@@ -37,7 +41,8 @@ enum Flavor {
     Receive {
         username: String,
         port: usize,
-        target_dir: Option<PathBuf>,
+        #[clap(default_value = "received_files")]
+        target_dir: PathBuf,
     },
     /// Start centralized receiver registry
     Registry,
@@ -46,8 +51,8 @@ enum Flavor {
 /// Size of the send/receive buffers.
 const BUF_SIZE: usize = 1024 * 1024 * 10;
 
-#[async_std::main]
-async fn main() -> Result<(), Error> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let opts: Opts = Opts::parse();
     match opts.flavor {
         Flavor::Send {
@@ -64,7 +69,7 @@ async fn main() -> Result<(), Error> {
             receive(
                 &username,
                 port,
-                target_dir.unwrap_or("received_files".into()),
+                target_dir,
                 &opts.registry,
             )
             .await?
@@ -74,54 +79,46 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-// All of the error handling is hacky at the moment. For a prod tool I would clean this up and add
-// extra information to aid the user.
-
-#[derive(Debug)]
-struct Error;
-
-impl<E: std::error::Error> From<E> for Error {
-    fn from(e: E) -> Error {
-        println!("{:?}", e);
-        Error
-    }
-}
-
-// Hack to unify errors
-fn map_err<T: std::fmt::Debug>(e: T) -> Error {
-    println!("{:?}", e);
-    Error
-}
-
 /// List all the registered receivers.
-async fn list(registry: &str) -> Result<(), Error> {
-    let res = surf::get(format!("http://{}", registry));
-    let map: Map = surf::client().recv_json(res).await.map_err(map_err)?;
+async fn list(registry: &str) -> Result<()> {
+    let client = hyper::Client::new();
+    let res = client.get(format!("http://{}", registry).parse()?).await?;
+    let body = hyper::body::aggregate(res).await?;
+    let map: Map = serde_json::from_reader(body.reader())?;
     println!("Currently registered users:\n");
     for username in map.0.keys() {
-        println!("{}", username);
+        println!("{username}");
     }
     Ok(())
 }
 
 /// Send a local file to a registered receiver.
-async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Result<(), Error> {
+async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Result<()> {
     if !path.exists() {
-        panic!("{} doesn't exist", path.display());
+        panic!("`{}` doesn't exist", path.display());
     }
-    let res = surf::get(format!("http://{}", registry));
+    if path.is_dir() {
+        panic!("only single files can be sent");
+    }
+    let client = hyper::Client::new();
+    let uri: http::Uri = format!("http://{}", registry).parse()?;
 
-    let map: Map = surf::client().recv_json(res).await.map_err(map_err)?;
+    let filename = path.components().last().unwrap();
+    let filename: &std::path::Path = filename.as_ref();
+
+    let res = client.get(uri).await?;
+    let body = hyper::body::aggregate(res).await?;
+    let map: Map = serde_json::from_reader(body.reader())?;
     let mut file = File::open(&path).await?;
 
     let mut stream = TcpStream::connect(&map.0[target]).await?;
-    let end = file.seek(async_std::io::SeekFrom::End(0)).await?;
-    let header = format!("{}:{}:{}", username, end, path.to_string_lossy());
+    let end = file.seek(tokio::io::SeekFrom::End(0)).await?;
+    let header = format!("{}:{}:{}", username, end, filename.display());
     stream.write_all(header.as_bytes()).await?;
 
-    let _ = file.seek(async_std::io::SeekFrom::Start(0)).await?;
+    let _ = file.seek(tokio::io::SeekFrom::Start(0)).await?;
     let mut go_ahead = vec![0];
-    stream.read(&mut go_ahead).await?;
+    let _bytes_read = stream.read(&mut go_ahead).await?;
     if go_ahead[0] != 1 {
         panic!("rejected");
     }
@@ -144,155 +141,166 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
 
 /// Set up a receiver service. It can only handle one file at a time because we don't negotiate a
 /// new port for each new incomming connection.
-async fn receive(
-    username: &str,
-    port: usize,
-    target_dir: PathBuf,
-    registry: &str,
-) -> Result<(), Error> {
-    // FIXME: Use POST instead of GET
-    let _res = surf::get(&format!(
-        "http://{}/register?username={}&target={}",
-        registry, username, port
-    ))
-    .await
-    .map_err(map_err)?;
+async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &str) -> Result<()> {
+    println!("Registering username {username} at {registry} to receive files on {port}");
+    let client = hyper::Client::new();
+    let uri: http::Uri = format!("http://{registry}/register").parse()?;
+    let post = hyper::Request::post(uri).body(hyper::Body::from(format!(
+        r#"{{ "username": "{username}", "port": {port} }}"#
+    )))?;
+    println!("{post:?}");
+    let _res = client.request(post).await?;
+    if !_res.status().is_success() {
+        let mut reader = hyper::body::aggregate(_res.into_body()).await?.reader();
+        let mut body = String::new();
+        reader.read_to_string(&mut body)?;
+
+        #[derive(Debug)]
+        struct E;
+        impl std::fmt::Display for E {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error")
+            }
+        }
+        impl std::error::Error for E {}
+        return Err(Box::new(E));
+    }
+    println!("{_res:?}");
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    let mut incoming = listener.incoming();
+    let (stream, _socket_addr) = listener.accept().await?;
     create_dir_all(&target_dir).await?;
+    println!("created dir {target_dir:?}");
 
-    while let Some(stream) = incoming.next().await {
-        let stream = stream?;
-        let target_dir = target_dir.clone();
-        task::spawn(async move { process(stream, target_dir).await });
-    }
+    // let target_dir = target_dir.clone();
+    process(stream, target_dir).await?;
+    // tokio::task::spawn(async move { process(stream, target_dir).await });
     Ok(())
 }
 
-async fn process(mut stream: TcpStream, target_dir: PathBuf) -> Result<(), Error> {
-    {
-        let mut contents = vec![0; BUF_SIZE];
+unsafe impl Send for ProcessErr {}
+unsafe impl Sync for ProcessErr {}
+
+#[derive(Debug)]
+enum ProcessErr {
+    Io(std::io::Error),
+    Utf8(std::str::Utf8Error),
+}
+impl std::fmt::Display for ProcessErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "{}", err),
+            Self::Utf8(err) => write!(f, "{}", err),
+        }
+    }
+}
+impl serde::ser::StdError for ProcessErr {}
+impl From<std::io::Error> for ProcessErr {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+impl From<std::str::Utf8Error> for ProcessErr {
+    fn from(e: std::str::Utf8Error) -> Self {
+        Self::Utf8(e)
+    }
+}
+async fn process(mut stream: TcpStream, mut path: PathBuf) -> std::result::Result<(), ProcessErr> {
+    let mut contents = vec![0; BUF_SIZE];
+    let n = stream.read(&mut contents).await?;
+    if n == 0 {
+        println!("username and path missing?");
+        return Ok(());
+    }
+    let header = std::str::from_utf8(&contents[..n])?.to_string();
+    let header = header.split(':').collect::<Vec<_>>();
+    let (username, file_len, file_name) = match &header[..] {
+        [username, file_len, file_name] => {
+            let file_len: std::result::Result<usize, _> = file_len.parse();
+            (username, file_len.unwrap(), file_name)
+        }
+        _ => panic!(),
+    };
+    println!("incoming file `{file_name}` from `{username}` with len {file_len}");
+    let _bytes_written = stream.write(&[1]).await?;
+
+    path.push(file_name);
+
+    // If the file already exists we overwrite it.
+    println!("writing to {:?}", path.display());
+    let mut file = File::create(&path).await?;
+    let mut total = 0;
+    let mut consecutive_zeros = 0;
+    loop {
         let n = stream.read(&mut contents).await?;
+        tokio::io::copy(&mut &contents[..n], &mut file).await?;
+        print!(".");
+
+        total += n;
+        if total == file_len || consecutive_zeros > 1000 {
+            break;
+        }
         if n == 0 {
-            println!("username and path missing?");
-            return Ok(());
+            consecutive_zeros += 1;
         }
-        let header = std::str::from_utf8(&contents[..n])?.to_string();
-        let header = header.split(':').collect::<Vec<_>>();
-        let (username, file_len, file_name) = match &header[..] {
-            [username, file_len, file_name] => {
-                let file_len: Result<usize, _> = file_len.parse();
-                (username, file_len.unwrap(), file_name)
-            }
-            _ => panic!(),
-        };
-        println!(
-            "incoming file `{}` from `{}` with len {}",
-            file_name, username, file_len
-        );
-        loop {
-            println!("accept? y/n");
-            let stdin = async_std::io::stdin();
-            let mut line = String::new();
-            stdin.read_line(&mut line).await?;
-            if line.trim().to_ascii_lowercase() == "n" {
-                println!("rejecting");
-                stream.write(&[0]).await?;
-                return Ok(());
-            } else if line.trim().to_ascii_lowercase() == "y" {
-                println!("accepting");
-                stream.write(&[1]).await?;
-                break;
-            }
-        }
-
-        let mut path: PathBuf = target_dir.into();
-        path.push(file_name);
-        // Maintain directory structure
-        create_dir_all(&path.parent().unwrap()).await?;
-
-        // TODO file already exists?
-        println!("writing to {:?}", path.display());
-        let mut file = File::create(&path).await?;
-        let mut total = 0;
-        let mut consecutive_zeros = 0;
-        loop {
-            let n = stream.read(&mut contents).await?;
-            async_std::io::copy(&contents[..n], &mut file).await?;
-            print!(".");
-
-            total += n;
-            if total == file_len || consecutive_zeros > 1000 {
-                break;
-            }
-            if n == 0 {
-                consecutive_zeros += 1;
-            }
-        }
-        println!("total {} of {}", total, file_len);
     }
+    println!("total {} of {}", total, file_len);
     Ok(())
-}
-
-/// Registry DB
-#[derive(Debug, Clone, Default)]
-struct State {
-    registry: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// Used only for JSON creation.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct Map(HashMap<String, String>);
 
-impl State {
-    fn register(&self, mapping: Mapping) {
-        let r = self.registry.lock();
-        let mut r = r.unwrap();
-        r.insert(mapping.username.unwrap(), mapping.target.unwrap());
+type S = Arc<Mutex<HashMap<String, String>>>;
+
+trait State {
+    fn new() -> Self;
+}
+
+impl State for S {
+    fn new() -> Self {
+        Default::default()
     }
 }
 
-unsafe impl Send for State {}
-unsafe impl Sync for State {}
-
-#[derive(Deserialize, Default, Debug)]
-#[serde(default)]
+#[derive(Deserialize, Serialize, Debug)]
 struct Mapping {
-    username: Option<String>,
-    target: Option<String>,
+    username: String,
+    port: u32,
 }
 
-async fn registry(reg: &str) -> tide::Result<()> {
-    let registry = State::default();
-    let mut app = tide::with_state(registry);
-    app.at("/").get(|req: Request<State>| {
-        async move {
-            let r = req.state().registry.lock();
-            let r = r.unwrap();
-            let mut res = tide::Response::new(200);
-            let map = Map(r.clone()); // FIXME: don't do this
-            res.set_body(tide::Body::from_json(&map)?);
-            Ok(res)
+async fn registry(reg: &str) -> std::result::Result<(), std::net::AddrParseError> {
+    let state = S::default();
+
+    // `/` serving JSON with the current mappings
+    let root = warp::path::end().map({
+        let state = state.clone();
+        move || {
+            warp::reply::json(&Map(state.lock().unwrap().clone()))
         }
     });
-    app.at("/register").get(|req: Request<State>| {
-        // FIXME: This should be POST not GET
-        async move {
-            let state = req.state();
-            let mut mapping: Mapping = req.query()?;
-            mapping.target = mapping.target.map(|port| {
-                format!(
-                    "{}:{}",
-                    req.remote().unwrap().split(":").next().unwrap(),
-                    port
-                )
-            });
-            println!("mapping {:?}", mapping);
-            state.register(mapping);
-            Ok("ok")
-        }
-    });
-    app.listen(reg).await?;
+
+    // `/register` POST handler
+    let register = warp::post()
+        .and(warp::path("register"))
+        .and(warp::body::content_length_limit(1024 * 16))
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .map({
+            let state = state.clone();
+            move |Mapping { username, port }, addr: Option<SocketAddr>| {
+                let ip_addr = addr.unwrap().ip();
+                let target_addr = format!("{ip_addr}:{port}");
+                let r = format!("Registering \"{username}\" at {target_addr} from {addr:?}");
+                println!("{r}");
+                state.lock().unwrap().insert(username, target_addr);
+                r
+            }
+        });
+    let routes = register.or(root);
+    println!("starting registry listening at `{reg}`");
+    let reg: std::net::SocketAddr = reg.parse()?;
+    warp::serve(routes).run(reg).await;
     Ok(())
 }
