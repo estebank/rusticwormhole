@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::fs::{create_dir_all, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::net::{TcpListener, TcpStream};
+use std::io::{Write};
 use warp::{Buf, Filter};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -111,14 +112,14 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
     let map: Map = serde_json::from_reader(body.reader())?;
     let mut file = File::open(&path).await?;
 
-    let mut stream = TcpStream::connect(&map.0[target]).await?;
+    let mut stream = TcpStream::connect(&map.0[target])?;
     let end = file.seek(tokio::io::SeekFrom::End(0)).await?;
     let header = format!("{}:{}:{}", username, end, filename.display());
-    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(header.as_bytes())?;
 
     let _ = file.seek(tokio::io::SeekFrom::Start(0)).await?;
     let mut go_ahead = vec![0];
-    let _bytes_read = stream.read(&mut go_ahead).await?;
+    let _bytes_read = stream.read(&mut go_ahead)?;
     if go_ahead[0] != 1 {
         panic!("rejected");
     }
@@ -127,8 +128,8 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
     let mut total = 0;
     loop {
         let n = file.read(&mut contents).await?;
-        stream.write_all(&contents[0..n]).await?;
-        stream.flush().await?;
+        stream.write_all(&contents[0..n])?;
+        stream.flush()?;
         print!(".");
         total += n;
         if n == 0 {
@@ -167,8 +168,8 @@ async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &st
     }
     println!("{_res:?}");
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    let (stream, _socket_addr) = listener.accept().await?;
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port))?;
+    let (stream, _socket_addr) = listener.accept()?;
     create_dir_all(&target_dir).await?;
     println!("created dir {target_dir:?}");
 
@@ -207,7 +208,7 @@ impl From<std::str::Utf8Error> for ProcessErr {
 }
 async fn process(mut stream: TcpStream, mut path: PathBuf) -> std::result::Result<(), ProcessErr> {
     let mut contents = vec![0; BUF_SIZE];
-    let n = stream.read(&mut contents).await?;
+    let n = stream.read(&mut contents)?;
     if n == 0 {
         println!("username and path missing?");
         return Ok(());
@@ -222,7 +223,7 @@ async fn process(mut stream: TcpStream, mut path: PathBuf) -> std::result::Resul
         _ => panic!(),
     };
     println!("incoming file `{file_name}` from `{username}` with len {file_len}");
-    let _bytes_written = stream.write(&[1]).await?;
+    let _bytes_written = stream.write(&[1])?;
 
     path.push(file_name);
 
@@ -232,7 +233,7 @@ async fn process(mut stream: TcpStream, mut path: PathBuf) -> std::result::Resul
     let mut total = 0;
     let mut consecutive_zeros = 0;
     loop {
-        let n = stream.read(&mut contents).await?;
+        let n = stream.read(&mut contents)?;
         tokio::io::copy(&mut &contents[..n], &mut file).await?;
         print!(".");
 
