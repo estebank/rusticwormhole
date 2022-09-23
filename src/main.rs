@@ -65,15 +65,7 @@ async fn main() -> Result<()> {
             username,
             port,
             target_dir,
-        } => {
-            receive(
-                &username,
-                port,
-                target_dir,
-                &opts.registry,
-            )
-            .await?
-        }
+        } => receive(&username, port, target_dir, &opts.registry).await?,
         Flavor::Registry => registry(&opts.registry).await.unwrap(),
     }
     Ok(())
@@ -276,9 +268,7 @@ async fn registry(reg: &str) -> std::result::Result<(), std::net::AddrParseError
     // `/` serving JSON with the current mappings
     let root = warp::path::end().map({
         let state = state.clone();
-        move || {
-            warp::reply::json(&Map(state.lock().unwrap().clone()))
-        }
+        move || warp::reply::json(&Map(state.lock().unwrap().clone()))
     });
 
     // `/register` POST handler
