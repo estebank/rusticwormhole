@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::fs::{create_dir_all, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use warp::{Buf, Filter};
 
@@ -123,6 +123,7 @@ async fn send(
 
     let mut contents = vec![0; buf_size];
     let mut total = 0;
+    let mut stream = BufReader::new(stream);
     loop {
         let n = if buf_size == 0 {
             file.read_to_end(&mut contents).await?
@@ -130,7 +131,7 @@ async fn send(
             file.read(&mut contents).await?
         };
         stream.write_all(&contents[0..n]).await?;
-        stream.flush().await?;
+        // stream.flush().await?;
         // print!(".");
         total += n;
         if n == 0 {
@@ -240,9 +241,10 @@ async fn process(
 
     // If the file already exists we overwrite it.
     println!("writing to {:?}", path.display());
-    let mut file = File::create(&path).await?;
+    let mut file = BufWriter::new(File::create(&path).await?);
     let mut total = 0;
     let mut consecutive_zeros = 0;
+    let mut stream = BufReader::new(stream);
     loop {
         let n = if buf_size == 0 {
             stream.read_to_end(&mut contents).await?
