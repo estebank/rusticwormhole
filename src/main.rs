@@ -124,10 +124,14 @@ async fn send(
     let mut contents = vec![0; buf_size];
     let mut total = 0;
     loop {
-        let n = file.read(&mut contents).await?;
+        let n = if buf_size == 0 {
+            file.read_to_end(&mut contents).await?
+        } else {
+            file.read(&mut contents).await?
+        };
         stream.write_all(&contents[0..n]).await?;
         stream.flush().await?;
-        print!(".");
+        // print!(".");
         total += n;
         if n == 0 {
             break;
@@ -214,7 +218,7 @@ async fn process(
     mut path: PathBuf,
     buf_size: usize,
 ) -> std::result::Result<(), ProcessErr> {
-    let mut contents = vec![0; buf_size];
+    let mut contents = vec![0; if buf_size == 0 { 1024 } else { buf_size }];
     let n = stream.read(&mut contents).await?;
     if n == 0 {
         println!("username and path missing?");
@@ -240,9 +244,13 @@ async fn process(
     let mut total = 0;
     let mut consecutive_zeros = 0;
     loop {
-        let n = stream.read(&mut contents).await?;
+        let n = if buf_size == 0 {
+            stream.read_to_end(&mut contents).await?
+        } else {
+            stream.read(&mut contents).await?
+        };
         tokio::io::copy(&mut &contents[..n], &mut file).await?;
-        print!(".");
+        // print!(".");
 
         total += n;
         if total == file_len || consecutive_zeros > 1000 {
