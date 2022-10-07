@@ -53,41 +53,44 @@ enum Flavor {
     Registry,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let opts: Opts = Opts::parse();
     match opts.flavor {
         Flavor::Send {
             username,
             target,
             path,
-        } => send(&username, &target, path, &opts.registry, opts.buf_size).await?,
-        Flavor::List => list(&opts.registry).await?,
+        } => send(&username, &target, path, &opts.registry, opts.buf_size)?,
+        Flavor::List => list(&opts.registry)?,
         Flavor::Receive {
             username,
             port,
             target_dir,
-        } => receive(&username, port, target_dir, &opts.registry, opts.buf_size).await?,
-        Flavor::Registry => registry(&opts.registry).await.unwrap(),
+        } => receive(&username, port, target_dir, &opts.registry, opts.buf_size)?,
+        Flavor::Registry => registry(&opts.registry).unwrap(),
     }
     Ok(())
 }
 
 /// List all the registered receivers.
-async fn list(registry: &str) -> Result<()> {
-    let client = hyper::Client::new();
-    let res = client.get(format!("http://{}", registry).parse()?).await?;
-    let body = hyper::body::aggregate(res).await?;
-    let map: Map = serde_json::from_reader(body.reader())?;
-    println!("Currently registered users:\n");
-    for username in map.0.keys() {
-        println!("{username}");
-    }
+fn list(registry: &str) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let client = hyper::Client::new();
+        let res = client.get(format!("http://{}", registry).parse().unwrap()).await.unwrap();
+        let body = hyper::body::aggregate(res).await.unwrap();
+        let map: Map = serde_json::from_reader(body.reader()).unwrap();
+        println!("Currently registered users:\n");
+        for username in map.0.keys() {
+            println!("{username}");
+        }
+    });
     Ok(())
+
 }
 
 /// Send a local file to a registered receiver.
-async fn send(
+fn send(
     username: &str,
     target: &str,
     path: PathBuf,
@@ -106,9 +109,14 @@ async fn send(
     let filename = path.components().last().unwrap();
     let filename: &std::path::Path = filename.as_ref();
 
-    let res = client.get(uri).await?;
-    let body = hyper::body::aggregate(res).await?;
-    let map: Map = serde_json::from_reader(body.reader())?;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let map = rt.block_on(async {
+        let res = client.get(uri).await.unwrap();
+        let body = hyper::body::aggregate(res).await.unwrap();
+        let map: Map = serde_json::from_reader(body.reader()).unwrap();
+        map
+    });
+    drop(rt);
     let mut file = File::open(&path)?;
 
     let mut stream = TcpStream::connect(&map.0[target])?;
@@ -145,7 +153,7 @@ async fn send(
 
 /// Set up a receiver service. It can only handle one file at a time because we don't negotiate a
 /// new port for each new incomming connection.
-async fn receive(
+fn receive(
     username: &str,
     port: usize,
     target_dir: PathBuf,
@@ -153,38 +161,42 @@ async fn receive(
     buf_size: usize,
 ) -> Result<()> {
     println!("Registering username {username} at {registry} to receive files on {port}");
-    let client = hyper::Client::new();
-    let uri: http::Uri = format!("http://{registry}/register").parse()?;
-    let post = hyper::Request::post(uri).body(hyper::Body::from(format!(
-        r#"{{ "username": "{username}", "port": {port} }}"#
-    )))?;
-    println!("{post:?}");
-    let _res = client.request(post).await?;
-    if !_res.status().is_success() {
-        let mut reader = hyper::body::aggregate(_res.into_body()).await?.reader();
-        let mut body = String::new();
-        reader.read_to_string(&mut body)?;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _ = rt.block_on(async {
+        let client = hyper::Client::new();
+        let uri: http::Uri = format!("http://{registry}/register").parse().unwrap();
+        let post = hyper::Request::post(uri).body(hyper::Body::from(format!(
+            r#"{{ "username": "{username}", "port": {port} }}"#
+        ))).unwrap();
+        println!("{post:?}");
+        let _res = client.request(post).await.unwrap();
+        if !_res.status().is_success() {
+            let mut reader = hyper::body::aggregate(_res.into_body()).await.unwrap().reader();
+            let mut body = String::new();
+            reader.read_to_string(&mut body).unwrap();
 
-        #[derive(Debug)]
-        struct E;
-        impl std::fmt::Display for E {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "error")
+            #[derive(Debug)]
+            struct E;
+            impl std::fmt::Display for E {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "error")
+                }
             }
+            impl std::error::Error for E {}
+            return Err(Box::new(E));
         }
-        impl std::error::Error for E {}
-        return Err(Box::new(E));
-    }
-    println!("{_res:?}");
+        println!("{_res:?}");
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port))?;
-    let (stream, _socket_addr) = listener.accept()?;
-    create_dir_all(&target_dir).await?;
-    println!("created dir {target_dir:?}");
+        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap();
+        let (stream, _socket_addr) = listener.accept().unwrap();
+        create_dir_all(&target_dir).await.unwrap();
+        println!("created dir {target_dir:?}");
 
-    // let target_dir = target_dir.clone();
-    process(stream, target_dir, buf_size).await?;
-    // tokio::task::spawn(async move { process(stream, target_dir).await });
+        // let target_dir = target_dir.clone();
+        process(stream, target_dir, buf_size).await.unwrap();
+        // tokio::task::spawn(async move { process(stream, target_dir).await });
+        Ok(())
+    });
     Ok(())
 }
 
@@ -288,35 +300,38 @@ struct Mapping {
     port: u32,
 }
 
-async fn registry(reg: &str) -> std::result::Result<(), std::net::AddrParseError> {
-    let state = S::default();
+fn registry(reg: &str) -> std::result::Result<(), std::net::AddrParseError> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let state = S::default();
 
-    // `/` serving JSON with the current mappings
-    let root = warp::path::end().map({
-        let state = state.clone();
-        move || warp::reply::json(&Map(state.lock().unwrap().clone()))
-    });
-
-    // `/register` POST handler
-    let register = warp::post()
-        .and(warp::path("register"))
-        .and(warp::body::content_length_limit(1024 * 16))
-        .and(warp::body::json())
-        .and(warp::addr::remote())
-        .map({
+        // `/` serving JSON with the current mappings
+        let root = warp::path::end().map({
             let state = state.clone();
-            move |Mapping { username, port }, addr: Option<SocketAddr>| {
-                let ip_addr = addr.unwrap().ip();
-                let target_addr = format!("{ip_addr}:{port}");
-                let r = format!("Registering \"{username}\" at {target_addr} from {addr:?}");
-                println!("{r}");
-                state.lock().unwrap().insert(username, target_addr);
-                r
-            }
+            move || warp::reply::json(&Map(state.lock().unwrap().clone()))
         });
-    let routes = register.or(root);
-    println!("starting registry listening at `{reg}`");
-    let reg: std::net::SocketAddr = reg.parse()?;
-    warp::serve(routes).run(reg).await;
-    Ok(())
+
+        // `/register` POST handler
+        let register = warp::post()
+            .and(warp::path("register"))
+            .and(warp::body::content_length_limit(1024 * 16))
+            .and(warp::body::json())
+            .and(warp::addr::remote())
+            .map({
+                let state = state.clone();
+                move |Mapping { username, port }, addr: Option<SocketAddr>| {
+                    let ip_addr = addr.unwrap().ip();
+                    let target_addr = format!("{ip_addr}:{port}");
+                    let r = format!("Registering \"{username}\" at {target_addr} from {addr:?}");
+                    println!("{r}");
+                    state.lock().unwrap().insert(username, target_addr);
+                    r
+                }
+            });
+        let routes = register.or(root);
+        println!("starting registry listening at `{reg}`");
+        let reg: std::net::SocketAddr = reg.parse()?;
+        warp::serve(routes).run(reg).await;
+        Ok(())
+    })
 }
