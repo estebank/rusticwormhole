@@ -100,14 +100,16 @@ fn send(
     if !path.exists() {
         panic!("`{}` doesn't exist", path.display());
     }
-    if path.is_dir() {
-        panic!("only single files can be sent");
+    if path.has_root() {
+        panic!("only relative paths are accepted");
     }
     let client = hyper::Client::new();
     let uri: http::Uri = format!("http://{}", registry).parse()?;
 
     let filename = path.components().last().unwrap();
     let filename: &std::path::Path = filename.as_ref();
+    let filename = filename.display();
+    println!("filename {filename}");
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let map = rt.block_on(async {
@@ -117,37 +119,60 @@ fn send(
         map
     });
     drop(rt);
-    let mut file = File::open(&path)?;
-
-    let mut stream = TcpStream::connect(&map.0[target])?;
-    let end = file.seek(std::io::SeekFrom::End(0))?;
-    let header = format!("{}:{}:{}", username, end, filename.display());
-    stream.write_all(header.as_bytes())?;
-
-    let _ = file.seek(std::io::SeekFrom::Start(0))?;
-    let mut go_ahead = vec![0];
-    let _bytes_read = stream.read(&mut go_ahead)?;
-    if go_ahead[0] != 1 {
-        panic!("rejected");
-    }
-
-    let mut contents = vec![0; buf_size];
-    let mut total = 0;
-    loop {
-        let n = if buf_size == 0 {
-            file.read_to_end(&mut contents)?
-        } else {
-            file.read(&mut contents)?
-        };
-        stream.write_all(&contents[0..n])?;
-        stream.flush()?;
-        // print!(".");
-        total += n;
-        if n == 0 {
-            break;
+    let mut handles = vec![];
+    let paths: Vec<PathBuf> = if path.is_dir() {
+        let x: Vec<PathBuf> = glob::glob(&format!("./{}/*", path.display())).ok().unwrap()
+            .filter_map(|p| p.ok())
+            .filter(|p| !p.is_dir())
+            .collect();
+        println!("{x:?}");
+        x
+    } else {
+        vec![path.clone().into()]
+    };
+    for path in paths {
+        let username = username.to_string();
+        let addr = map.0[target].clone();
+        if path.is_dir() {
+            panic!("{:?}", path);
         }
+        handles.push(std::thread::spawn(move || {
+            let mut file = File::open(&path).unwrap();
+
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let end = file.seek(std::io::SeekFrom::End(0)).unwrap();
+            let header = format!("{}:{}:{}", username, end, path.display());
+            stream.write_all(header.as_bytes()).unwrap();
+
+            let _ = file.seek(std::io::SeekFrom::Start(0)).unwrap();
+            let mut go_ahead = vec![0];
+            let _bytes_read = stream.read(&mut go_ahead).unwrap();
+            if go_ahead[0] != 1 {
+                panic!("rejected");
+            }
+
+            let mut contents = vec![0; buf_size];
+            let mut total = 0;
+            loop {
+                let n = if buf_size == 0 {
+                    file.read_to_end(&mut contents).unwrap()
+                } else {
+                    file.read(&mut contents).unwrap()
+                };
+                stream.write_all(&contents[0..n]).unwrap();
+                stream.flush().unwrap();
+                // print!(".");
+                total += n;
+                if n == 0 {
+                    break;
+                }
+            }
+            println!("total {}", total);
+        }));
     }
-    println!("total {}", total);
+    for handle in handles {
+        handle.join();
+    }
     Ok(())
 }
 
@@ -186,14 +211,23 @@ fn receive(
             return Err(Box::new(E));
         }
         println!("{_res:?}");
-
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap();
-        let (stream, _socket_addr) = listener.accept().unwrap();
         create_dir_all(&target_dir).await.unwrap();
         println!("created dir {target_dir:?}");
 
+        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap();
+        // let (stream, _socket_addr) = listener.accept().unwrap();
+        let mut handles = vec![];
+        while let Ok((stream, _socket_addr)) = listener.accept() {
+            let target_dir = target_dir.clone();
+            handles.push(std::thread::spawn(move || {
+                process(stream, target_dir, buf_size).unwrap();
+            }));
+        }
+        for handle in handles {
+            // wait for all threads to finish
+            handle.join();
+        }
         // let target_dir = target_dir.clone();
-        process(stream, target_dir, buf_size).await.unwrap();
         // tokio::task::spawn(async move { process(stream, target_dir).await });
         Ok(())
     });
@@ -227,7 +261,7 @@ impl From<std::str::Utf8Error> for ProcessErr {
         Self::Utf8(e)
     }
 }
-async fn process(
+fn process(
     mut stream: TcpStream,
     mut path: PathBuf,
     buf_size: usize,
@@ -250,6 +284,12 @@ async fn process(
     println!("incoming file `{file_name}` from `{username}` with len {file_len}");
     let _bytes_written = stream.write(&[1])?;
 
+    if file_name.contains('/') {
+        let mut path = path.clone();
+        path.push(file_name.rsplit_once('/').unwrap().0);
+        println!("{:?}", path);
+        std::fs::create_dir_all(path).unwrap();
+    }
     path.push(file_name);
 
     // If the file already exists we overwrite it.
