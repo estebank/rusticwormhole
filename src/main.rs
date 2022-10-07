@@ -2,15 +2,16 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
+use std::fs::File;
 use std::io::Read;
+use std::io::Seek;
+use std::io::Write;
 use std::net::SocketAddr;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::fs::{create_dir_all, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use std::net::{TcpListener, TcpStream};
-use std::io::{Write};
+use tokio::fs::create_dir_all;
 use warp::{Buf, Filter};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -23,6 +24,9 @@ struct Opts {
     registry: String,
     #[clap(subcommand)]
     flavor: Flavor,
+    #[clap(long, default_value = "10485760")] // 1024 * 1024 * 10
+    /// Size of the send/receive buffers.
+    buf_size: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -49,9 +53,6 @@ enum Flavor {
     Registry,
 }
 
-/// Size of the send/receive buffers.
-const BUF_SIZE: usize = 1024 * 1024 * 10;
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let opts: Opts = Opts::parse();
@@ -60,21 +61,13 @@ async fn main() -> Result<()> {
             username,
             target,
             path,
-        } => send(&username, &target, path, &opts.registry).await?,
+        } => send(&username, &target, path, &opts.registry, opts.buf_size).await?,
         Flavor::List => list(&opts.registry).await?,
         Flavor::Receive {
             username,
             port,
             target_dir,
-        } => {
-            receive(
-                &username,
-                port,
-                target_dir,
-                &opts.registry,
-            )
-            .await?
-        }
+        } => receive(&username, port, target_dir, &opts.registry, opts.buf_size).await?,
         Flavor::Registry => registry(&opts.registry).await.unwrap(),
     }
     Ok(())
@@ -94,7 +87,13 @@ async fn list(registry: &str) -> Result<()> {
 }
 
 /// Send a local file to a registered receiver.
-async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Result<()> {
+async fn send(
+    username: &str,
+    target: &str,
+    path: PathBuf,
+    registry: &str,
+    buf_size: usize,
+) -> Result<()> {
     if !path.exists() {
         panic!("`{}` doesn't exist", path.display());
     }
@@ -110,27 +109,31 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
     let res = client.get(uri).await?;
     let body = hyper::body::aggregate(res).await?;
     let map: Map = serde_json::from_reader(body.reader())?;
-    let mut file = File::open(&path).await?;
+    let mut file = File::open(&path)?;
 
     let mut stream = TcpStream::connect(&map.0[target])?;
-    let end = file.seek(tokio::io::SeekFrom::End(0)).await?;
+    let end = file.seek(std::io::SeekFrom::End(0))?;
     let header = format!("{}:{}:{}", username, end, filename.display());
     stream.write_all(header.as_bytes())?;
 
-    let _ = file.seek(tokio::io::SeekFrom::Start(0)).await?;
+    let _ = file.seek(std::io::SeekFrom::Start(0))?;
     let mut go_ahead = vec![0];
     let _bytes_read = stream.read(&mut go_ahead)?;
     if go_ahead[0] != 1 {
         panic!("rejected");
     }
 
-    let mut contents = vec![0; BUF_SIZE];
+    let mut contents = vec![0; buf_size];
     let mut total = 0;
     loop {
-        let n = file.read(&mut contents).await?;
+        let n = if buf_size == 0 {
+            file.read_to_end(&mut contents)?
+        } else {
+            file.read(&mut contents)?
+        };
         stream.write_all(&contents[0..n])?;
         stream.flush()?;
-        print!(".");
+        // print!(".");
         total += n;
         if n == 0 {
             break;
@@ -142,7 +145,13 @@ async fn send(username: &str, target: &str, path: PathBuf, registry: &str) -> Re
 
 /// Set up a receiver service. It can only handle one file at a time because we don't negotiate a
 /// new port for each new incomming connection.
-async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &str) -> Result<()> {
+async fn receive(
+    username: &str,
+    port: usize,
+    target_dir: PathBuf,
+    registry: &str,
+    buf_size: usize,
+) -> Result<()> {
     println!("Registering username {username} at {registry} to receive files on {port}");
     let client = hyper::Client::new();
     let uri: http::Uri = format!("http://{registry}/register").parse()?;
@@ -174,7 +183,7 @@ async fn receive(username: &str, port: usize, target_dir: PathBuf, registry: &st
     println!("created dir {target_dir:?}");
 
     // let target_dir = target_dir.clone();
-    process(stream, target_dir).await?;
+    process(stream, target_dir, buf_size).await?;
     // tokio::task::spawn(async move { process(stream, target_dir).await });
     Ok(())
 }
@@ -206,8 +215,12 @@ impl From<std::str::Utf8Error> for ProcessErr {
         Self::Utf8(e)
     }
 }
-async fn process(mut stream: TcpStream, mut path: PathBuf) -> std::result::Result<(), ProcessErr> {
-    let mut contents = vec![0; BUF_SIZE];
+async fn process(
+    mut stream: TcpStream,
+    mut path: PathBuf,
+    buf_size: usize,
+) -> std::result::Result<(), ProcessErr> {
+    let mut contents = vec![0; if buf_size == 0 { 1024 } else { buf_size }];
     let n = stream.read(&mut contents)?;
     if n == 0 {
         println!("username and path missing?");
@@ -229,13 +242,17 @@ async fn process(mut stream: TcpStream, mut path: PathBuf) -> std::result::Resul
 
     // If the file already exists we overwrite it.
     println!("writing to {:?}", path.display());
-    let mut file = File::create(&path).await?;
+    let mut file = File::create(&path)?;
     let mut total = 0;
     let mut consecutive_zeros = 0;
     loop {
-        let n = stream.read(&mut contents)?;
-        tokio::io::copy(&mut &contents[..n], &mut file).await?;
-        print!(".");
+        let n = if buf_size == 0 {
+            stream.read_to_end(&mut contents)?
+        } else {
+            stream.read(&mut contents)?
+        };
+        std::io::copy(&mut &contents[..n], &mut file)?;
+        // print!(".");
 
         total += n;
         if total == file_len || consecutive_zeros > 1000 {
@@ -277,9 +294,7 @@ async fn registry(reg: &str) -> std::result::Result<(), std::net::AddrParseError
     // `/` serving JSON with the current mappings
     let root = warp::path::end().map({
         let state = state.clone();
-        move || {
-            warp::reply::json(&Map(state.lock().unwrap().clone()))
-        }
+        move || warp::reply::json(&Map(state.lock().unwrap().clone()))
     });
 
     // `/register` POST handler
