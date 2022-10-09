@@ -8,6 +8,7 @@ use std::io::Seek;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::prelude::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -155,12 +156,31 @@ fn send(
             let mut total = 0;
             loop {
                 let n = if buf_size == 0 {
-                    file.read_to_end(&mut contents).unwrap()
+                    // file.read_to_end(&mut contents).unwrap()
+                    let file_ptr = file.as_raw_fd();
+                    let socket_ptr = stream.as_raw_fd();
+                    let mut length = 0; // Send all bytes.
+                    let offset = 0 as libc::off_t;
+                    let res = unsafe {
+                        libc::sendfile(
+                            file_ptr,
+                            socket_ptr,
+                            offset,
+                            &mut length,
+                            std::ptr::null_mut(),
+                            0,
+                        )
+                    };
+                    println!("received {length:?} {res:?}");
+                    // stream.write_all(&contents[0..n]).unwrap();
+                    break;
+                    length as usize
                 } else {
-                    file.read(&mut contents).unwrap()
+                    let n = file.read(&mut contents).unwrap();
+                    stream.write_all(&contents[0..n]).unwrap();
+                    stream.flush().unwrap();
+                    n
                 };
-                stream.write_all(&contents[0..n]).unwrap();
-                stream.flush().unwrap();
                 // print!(".");
                 total += n;
                 if n == 0 {
@@ -266,7 +286,7 @@ fn process(
     mut path: PathBuf,
     buf_size: usize,
 ) -> std::result::Result<(), ProcessErr> {
-    let mut contents = vec![0; if buf_size == 0 { 1024 } else { buf_size }];
+    let mut contents = vec![0; if buf_size == 0 { 102400000 } else { buf_size }];
     let n = stream.read(&mut contents)?;
     if n == 0 {
         println!("username and path missing?");
@@ -299,7 +319,24 @@ fn process(
     let mut consecutive_zeros = 0;
     loop {
         let n = if buf_size == 0 {
-            stream.read_to_end(&mut contents)?
+            // stream.read_to_end(&mut contents)?
+            // let file_ptr = file.as_raw_fd();
+            // let socket_ptr = stream.as_raw_fd();
+            // let mut length = 0; // Send all bytes.
+            // let offset = 0 as libc::off_t;
+            // let res = unsafe {
+            //     libc::sendfile(
+            //         socket_ptr,
+            //         file_ptr,
+            //         offset,
+            //         &mut length,
+            //         std::ptr::null_mut(),
+            //         0,
+            //     )
+            // };
+            // println!("received {length:?} {res:?}");
+            // break;
+            stream.read(&mut contents)?
         } else {
             stream.read(&mut contents)?
         };
