@@ -212,6 +212,11 @@ fn send(
         let x: Vec<PathBuf> = glob::glob(&format!("./{}/*", path.display()))
             .ok()
             .unwrap()
+            .chain(
+                glob::glob(&format!("./{}/**/*", path.display()))
+                    .ok()
+                    .unwrap(),
+            )
             .filter_map(|p| p.ok())
             .filter(|p| !p.is_dir())
             .collect();
