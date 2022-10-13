@@ -78,7 +78,10 @@ fn list(registry: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let client = hyper::Client::new();
-        let res = client.get(format!("http://{}", registry).parse().unwrap()).await.unwrap();
+        let res = client
+            .get(format!("http://{}", registry).parse().unwrap())
+            .await
+            .unwrap();
         let body = hyper::body::aggregate(res).await.unwrap();
         let map: Map = serde_json::from_reader(body.reader()).unwrap();
         println!("Currently registered users:\n");
@@ -87,7 +90,80 @@ fn list(registry: &str) -> Result<()> {
         }
     });
     Ok(())
+}
 
+#[cfg(target_os = "macos")]
+fn sendfile(file: impl AsRawFd, stream: impl AsRawFd) -> std::io::Result<usize> {
+    let file_ptr = file.as_raw_fd();
+    let socket_ptr = stream.as_raw_fd();
+    let mut length = 0; // Send all bytes.
+    let offset = 0 as libc::off_t;
+    let res = unsafe {
+        libc::sendfile(
+            file_ptr,
+            socket_ptr,
+            offset,
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if res == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(res as usize)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sendfile(file: impl AsRawFd, stream: impl AsRawFd) {
+    let file = file.as_raw_fd();
+    let socket = socket.as_raw_fd();
+    // This is the maximum the Linux kernel will write in a single call.
+    let count = 0x7ffff000;
+    let mut offset = self.written as libc::off_t;
+    let res = unsafe { libc::sendfile(socket, file, &mut offset, count) };
+    if res == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(res as usize)
+    }
+}
+
+fn send_single_file(path: PathBuf, addr: String, username: String, buf_size: usize) {
+    let mut file = File::open(&path).unwrap();
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let end = file.seek(std::io::SeekFrom::End(0)).unwrap();
+    let header = format!("{}:{}:{}", username, end, path.display());
+    stream.write_all(header.as_bytes()).unwrap();
+
+    let _ = file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    let mut go_ahead = vec![0];
+    let _bytes_read = stream.read(&mut go_ahead).unwrap();
+    if go_ahead[0] != 1 {
+        panic!("rejected");
+    }
+
+    let mut contents = vec![0; buf_size];
+    let mut total = 0;
+    loop {
+        let n = if buf_size == 0 {
+            let res = sendfile(file, stream);
+            println!("received {res:?}");
+            break;
+        } else {
+            let n = file.read(&mut contents).unwrap();
+            stream.write_all(&contents[0..n]).unwrap();
+            stream.flush().unwrap();
+            n
+        };
+        total += n;
+        if n == 0 {
+            break;
+        }
+    }
+    println!("total {}", total);
 }
 
 /// Send a local file to a registered receiver.
@@ -122,7 +198,9 @@ fn send(
     drop(rt);
     let mut handles = vec![];
     let paths: Vec<PathBuf> = if path.is_dir() {
-        let x: Vec<PathBuf> = glob::glob(&format!("./{}/*", path.display())).ok().unwrap()
+        let x: Vec<PathBuf> = glob::glob(&format!("./{}/*", path.display()))
+            .ok()
+            .unwrap()
             .filter_map(|p| p.ok())
             .filter(|p| !p.is_dir())
             .collect();
@@ -131,6 +209,9 @@ fn send(
     } else {
         vec![path.clone().into()]
     };
+    // let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+    // pool.install(|| fib(20));
+
     for path in paths {
         let username = username.to_string();
         let addr = map.0[target].clone();
@@ -138,60 +219,11 @@ fn send(
             panic!("{:?}", path);
         }
         handles.push(std::thread::spawn(move || {
-            let mut file = File::open(&path).unwrap();
-
-            let mut stream = TcpStream::connect(addr).unwrap();
-            let end = file.seek(std::io::SeekFrom::End(0)).unwrap();
-            let header = format!("{}:{}:{}", username, end, path.display());
-            stream.write_all(header.as_bytes()).unwrap();
-
-            let _ = file.seek(std::io::SeekFrom::Start(0)).unwrap();
-            let mut go_ahead = vec![0];
-            let _bytes_read = stream.read(&mut go_ahead).unwrap();
-            if go_ahead[0] != 1 {
-                panic!("rejected");
-            }
-
-            let mut contents = vec![0; buf_size];
-            let mut total = 0;
-            loop {
-                let n = if buf_size == 0 {
-                    // file.read_to_end(&mut contents).unwrap()
-                    let file_ptr = file.as_raw_fd();
-                    let socket_ptr = stream.as_raw_fd();
-                    let mut length = 0; // Send all bytes.
-                    let offset = 0 as libc::off_t;
-                    let res = unsafe {
-                        libc::sendfile(
-                            file_ptr,
-                            socket_ptr,
-                            offset,
-                            &mut length,
-                            std::ptr::null_mut(),
-                            0,
-                        )
-                    };
-                    println!("received {length:?} {res:?}");
-                    // stream.write_all(&contents[0..n]).unwrap();
-                    break;
-                    length as usize
-                } else {
-                    let n = file.read(&mut contents).unwrap();
-                    stream.write_all(&contents[0..n]).unwrap();
-                    stream.flush().unwrap();
-                    n
-                };
-                // print!(".");
-                total += n;
-                if n == 0 {
-                    break;
-                }
-            }
-            println!("total {}", total);
+            send_single_file(path, addr, username, buf_size)
         }));
     }
     for handle in handles {
-        handle.join();
+        let _ = handle.join();
     }
     Ok(())
 }
@@ -210,13 +242,18 @@ fn receive(
     let _ = rt.block_on(async {
         let client = hyper::Client::new();
         let uri: http::Uri = format!("http://{registry}/register").parse().unwrap();
-        let post = hyper::Request::post(uri).body(hyper::Body::from(format!(
-            r#"{{ "username": "{username}", "port": {port} }}"#
-        ))).unwrap();
+        let post = hyper::Request::post(uri)
+            .body(hyper::Body::from(format!(
+                r#"{{ "username": "{username}", "port": {port} }}"#
+            )))
+            .unwrap();
         println!("{post:?}");
         let _res = client.request(post).await.unwrap();
         if !_res.status().is_success() {
-            let mut reader = hyper::body::aggregate(_res.into_body()).await.unwrap().reader();
+            let mut reader = hyper::body::aggregate(_res.into_body())
+                .await
+                .unwrap()
+                .reader();
             let mut body = String::new();
             reader.read_to_string(&mut body).unwrap();
 
@@ -235,7 +272,6 @@ fn receive(
         println!("created dir {target_dir:?}");
 
         let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap();
-        // let (stream, _socket_addr) = listener.accept().unwrap();
         let mut handles = vec![];
         while let Ok((stream, _socket_addr)) = listener.accept() {
             let target_dir = target_dir.clone();
@@ -245,10 +281,8 @@ fn receive(
         }
         for handle in handles {
             // wait for all threads to finish
-            handle.join();
+            let _ = handle.join();
         }
-        // let target_dir = target_dir.clone();
-        // tokio::task::spawn(async move { process(stream, target_dir).await });
         Ok(())
     });
     Ok(())
@@ -319,29 +353,11 @@ fn process(
     let mut consecutive_zeros = 0;
     loop {
         let n = if buf_size == 0 {
-            // stream.read_to_end(&mut contents)?
-            // let file_ptr = file.as_raw_fd();
-            // let socket_ptr = stream.as_raw_fd();
-            // let mut length = 0; // Send all bytes.
-            // let offset = 0 as libc::off_t;
-            // let res = unsafe {
-            //     libc::sendfile(
-            //         socket_ptr,
-            //         file_ptr,
-            //         offset,
-            //         &mut length,
-            //         std::ptr::null_mut(),
-            //         0,
-            //     )
-            // };
-            // println!("received {length:?} {res:?}");
-            // break;
             stream.read(&mut contents)?
         } else {
             stream.read(&mut contents)?
         };
         std::io::copy(&mut &contents[..n], &mut file)?;
-        // print!(".");
 
         total += n;
         if total == file_len || consecutive_zeros > 1000 {
