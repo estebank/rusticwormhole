@@ -38,8 +38,11 @@ enum Flavor {
         username: String,
         /// Username of the receiver
         target: String,
-        /// File to be sent
+        /// File or directory to be sent
         path: PathBuf,
+        #[clap(long, default_value = "8")]
+        /// Customize the number of concurrent files that are allowed to be sent
+        threadpool_size: usize,
     },
     /// List all the registered receivers
     List,
@@ -61,7 +64,15 @@ fn main() -> Result<()> {
             username,
             target,
             path,
-        } => send(&username, &target, path, &opts.registry, opts.buf_size)?,
+            threadpool_size,
+        } => send(
+            &username,
+            &target,
+            path,
+            &opts.registry,
+            opts.buf_size,
+            threadpool_size,
+        )?,
         Flavor::List => list(&opts.registry)?,
         Flavor::Receive {
             username,
@@ -173,6 +184,7 @@ fn send(
     path: PathBuf,
     registry: &str,
     buf_size: usize,
+    threadpool_size: usize,
 ) -> Result<()> {
     if !path.exists() {
         panic!("`{}` doesn't exist", path.display());
@@ -196,7 +208,6 @@ fn send(
         map
     });
     drop(rt);
-    let mut handles = vec![];
     let paths: Vec<PathBuf> = if path.is_dir() {
         let x: Vec<PathBuf> = glob::glob(&format!("./{}/*", path.display()))
             .ok()
@@ -209,22 +220,20 @@ fn send(
     } else {
         vec![path.clone().into()]
     };
-    // let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
-    // pool.install(|| fib(20));
-
-    for path in paths {
-        let username = username.to_string();
-        let addr = map.0[target].clone();
-        if path.is_dir() {
-            panic!("{:?}", path);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threadpool_size)
+        .build()
+        .unwrap();
+    pool.scope(|s| {
+        for path in paths {
+            let username = username.to_string();
+            let addr = map.0[target].clone();
+            if path.is_dir() {
+                panic!("file {:?}", path);
+            }
+            s.spawn(move |_| send_single_file(path, addr, username, buf_size));
         }
-        handles.push(std::thread::spawn(move || {
-            send_single_file(path, addr, username, buf_size)
-        }));
-    }
-    for handle in handles {
-        let _ = handle.join();
-    }
+    });
     Ok(())
 }
 
@@ -272,17 +281,18 @@ fn receive(
         println!("created dir {target_dir:?}");
 
         let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap();
-        let mut handles = vec![];
-        while let Ok((stream, _socket_addr)) = listener.accept() {
-            let target_dir = target_dir.clone();
-            handles.push(std::thread::spawn(move || {
-                process(stream, target_dir, buf_size).unwrap();
-            }));
-        }
-        for handle in handles {
-            // wait for all threads to finish
-            let _ = handle.join();
-        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        pool.scope(|s| {
+            while let Ok((stream, _socket_addr)) = listener.accept() {
+                let target_dir = target_dir.clone();
+                s.spawn(move |_| {
+                    process(stream, target_dir, buf_size).unwrap();
+                });
+            }
+        });
         Ok(())
     });
     Ok(())
