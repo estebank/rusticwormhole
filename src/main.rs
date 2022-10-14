@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
+use rayon::ThreadPoolBuildError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::error::Error;
+// use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use std::io::Seek;
@@ -15,7 +16,7 @@ use std::sync::Mutex;
 use tokio::fs::create_dir_all;
 use warp::{Buf, Filter};
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Result<T> = std::result::Result<T, Error>;
 
 /// Magic Wormhole clone
 #[derive(Debug, Parser)]
@@ -30,6 +31,7 @@ struct Opts {
     buf_size: usize,
 }
 
+/// All the possible mode of operation of this application
 #[derive(Debug, Subcommand)]
 enum Flavor {
     /// Send a local file to a registered receiver
@@ -41,7 +43,7 @@ enum Flavor {
         /// File or directory to be sent
         path: PathBuf,
         #[clap(long, default_value = "8")]
-        /// Customize the number of concurrent files that are allowed to be sent
+        /// Number of files that are allowed to be sent at the same time
         threadpool_size: usize,
     },
     /// List all the registered receivers
@@ -72,37 +74,35 @@ fn main() -> Result<()> {
             &opts.registry,
             opts.buf_size,
             threadpool_size,
-        )?,
-        Flavor::List => list(&opts.registry)?,
+        ),
+        Flavor::List => list(&opts.registry),
         Flavor::Receive {
             username,
             port,
             target_dir,
-        } => receive(&username, port, target_dir, &opts.registry, opts.buf_size)?,
-        Flavor::Registry => registry(&opts.registry).unwrap(),
+        } => receive(&username, port, target_dir, &opts.registry, opts.buf_size),
+        Flavor::Registry => registry(&opts.registry),
     }
-    Ok(())
 }
 
 /// List all the registered receivers.
 fn list(registry: &str) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new()?;
+    let uri = format!("http://{}", registry).parse()?;
     rt.block_on(async {
         let client = hyper::Client::new();
-        let res = client
-            .get(format!("http://{}", registry).parse().unwrap())
-            .await
-            .unwrap();
-        let body = hyper::body::aggregate(res).await.unwrap();
-        let map: Map = serde_json::from_reader(body.reader()).unwrap();
+        let res = client.get(uri).await?;
+        let body = hyper::body::aggregate(res).await?;
+        let map: Map = serde_json::from_reader(body.reader())?;
         println!("Currently registered users:\n");
         for username in map.0.keys() {
             println!("{username}");
         }
-    });
-    Ok(())
+        Ok(())
+    })
 }
 
+/// Minimal wrapper arround syscall `sendfile`
 #[cfg(target_os = "macos")]
 fn sendfile(file: impl AsRawFd, stream: impl AsRawFd) -> std::io::Result<usize> {
     let file_ptr = file.as_raw_fd();
@@ -126,6 +126,7 @@ fn sendfile(file: impl AsRawFd, stream: impl AsRawFd) -> std::io::Result<usize> 
     }
 }
 
+/// Minimal wrapper arround syscall `sendfile`
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn sendfile(file: impl AsRawFd, stream: impl AsRawFd) {
     let file = file.as_raw_fd();
@@ -141,43 +142,46 @@ fn sendfile(file: impl AsRawFd, stream: impl AsRawFd) {
     }
 }
 
-fn send_single_file(path: PathBuf, addr: String, username: String, buf_size: usize) {
-    let mut file = File::open(&path).unwrap();
+/// Send the contents of `path` to `addr`.
+fn send_single_file(path: PathBuf, addr: String, username: String, buf_size: usize) -> Result<()> {
+    let mut file = File::open(&path)?;
 
-    let mut stream = TcpStream::connect(addr).unwrap();
-    let end = file.seek(std::io::SeekFrom::End(0)).unwrap();
+    let mut stream = TcpStream::connect(addr)?;
+    let end = file.seek(std::io::SeekFrom::End(0))?;
     let header = format!("{}:{}:{}", username, end, path.display());
-    stream.write_all(header.as_bytes()).unwrap();
+    stream.write_all(header.as_bytes())?;
 
-    let _ = file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    let _ = file.seek(std::io::SeekFrom::Start(0))?;
     let mut go_ahead = vec![0];
-    let _bytes_read = stream.read(&mut go_ahead).unwrap();
+    let _bytes_read = stream.read(&mut go_ahead)?;
     if go_ahead[0] != 1 {
         panic!("rejected");
+    }
+
+    if buf_size == 0 {
+        match sendfile(file, stream) {
+            Ok(_bytes) => println!("[sender] Sent `{}`", path.display()),
+            Err(err) => println!("[sender] Could not send `{}`: {err:?}", path.display()),
+        }
+        return Ok(());
     }
 
     let mut contents = vec![0; buf_size];
     let mut total = 0;
     loop {
-        let n = if buf_size == 0 {
-            let res = sendfile(file, stream);
-            println!("received {res:?}");
-            break;
-        } else {
-            let n = file.read(&mut contents).unwrap();
-            stream.write_all(&contents[0..n]).unwrap();
-            stream.flush().unwrap();
-            n
-        };
+        let n = file.read(&mut contents)?;
+        stream.write_all(&contents[0..n])?;
+        stream.flush()?;
         total += n;
         if n == 0 {
             break;
         }
     }
-    println!("total {}", total);
+    println!("[sender] Sent {total} bytes from `{}`", path.display());
+    Ok(())
 }
 
-/// Send a local file to a registered receiver.
+/// Send a local file or directory to a registered receiver.
 fn send(
     username: &str,
     target: &str,
@@ -190,60 +194,57 @@ fn send(
         panic!("`{}` doesn't exist", path.display());
     }
     if path.has_root() {
-        panic!("only relative paths are accepted");
+        panic!("Only relative paths are accepted");
     }
     let client = hyper::Client::new();
     let uri: http::Uri = format!("http://{}", registry).parse()?;
 
-    let filename = path.components().last().unwrap();
-    let filename: &std::path::Path = filename.as_ref();
-    let filename = filename.display();
-    println!("filename {filename}");
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new()?;
     let map = rt.block_on(async {
         let res = client.get(uri).await.unwrap();
         let body = hyper::body::aggregate(res).await.unwrap();
-        let map: Map = serde_json::from_reader(body.reader()).unwrap();
+        let map: std::result::Result<Map, _> = serde_json::from_reader(body.reader());
         map
     });
+    let map = map?;
     drop(rt);
+
     let paths: Vec<PathBuf> = if path.is_dir() {
-        let x: Vec<PathBuf> = glob::glob(&format!("./{}/*", path.display()))
-            .ok()
-            .unwrap()
-            .chain(
-                glob::glob(&format!("./{}/**/*", path.display()))
-                    .ok()
-                    .unwrap(),
-            )
+        let paths: Vec<PathBuf> = glob::glob(&format!("./{}/*", path.display()))?
+            .chain(glob::glob(&format!("./{}/**/*", path.display()))?)
             .filter_map(|p| p.ok())
-            .filter(|p| !p.is_dir())
+            .filter(|p| p.is_file())
             .collect();
-        println!("{x:?}");
-        x
+        println!(
+            "[sender] Sending file{}: {}",
+            if paths.len() == 1 { "" } else { "s" },
+            paths
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        paths
     } else {
+        println!("[sender] Sending file: `{}`", path.display());
         vec![path.clone().into()]
     };
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threadpool_size)
-        .build()
-        .unwrap();
+        .build()?;
     pool.scope(|s| {
         for path in paths {
             let username = username.to_string();
             let addr = map.0[target].clone();
-            if path.is_dir() {
-                panic!("file {:?}", path);
-            }
-            s.spawn(move |_| send_single_file(path, addr, username, buf_size));
+            s.spawn(move |_| {
+                send_single_file(path, addr, username, buf_size).unwrap();
+            });
         }
     });
     Ok(())
 }
 
-/// Set up a receiver service. It can only handle one file at a time because we don't negotiate a
-/// new port for each new incomming connection.
+/// Set up a receiver service.
 fn receive(
     username: &str,
     port: usize,
@@ -251,45 +252,30 @@ fn receive(
     registry: &str,
     buf_size: usize,
 ) -> Result<()> {
-    println!("Registering username {username} at {registry} to receive files on {port}");
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _ = rt.block_on(async {
+    println!("[receiver] Registering username {username} at {registry} to receive files on {port}");
+    let rt = tokio::runtime::Runtime::new()?;
+    let uri: http::Uri = format!("http://{registry}/register").parse().unwrap();
+    rt.block_on(async {
         let client = hyper::Client::new();
-        let uri: http::Uri = format!("http://{registry}/register").parse().unwrap();
-        let post = hyper::Request::post(uri)
-            .body(hyper::Body::from(format!(
-                r#"{{ "username": "{username}", "port": {port} }}"#
-            )))
-            .unwrap();
-        println!("{post:?}");
-        let _res = client.request(post).await.unwrap();
+        let post = hyper::Request::post(uri).body(hyper::Body::from(format!(
+            r#"{{ "username": "{username}", "port": {port} }}"#
+        )))?;
+        let _res = client.request(post).await?;
         if !_res.status().is_success() {
-            let mut reader = hyper::body::aggregate(_res.into_body())
-                .await
-                .unwrap()
-                .reader();
+            let mut reader = hyper::body::aggregate(_res.into_body()).await?.reader();
             let mut body = String::new();
-            reader.read_to_string(&mut body).unwrap();
+            reader.read_to_string(&mut body)?;
 
-            #[derive(Debug)]
-            struct E;
-            impl std::fmt::Display for E {
-                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    write!(f, "error")
-                }
-            }
-            impl std::error::Error for E {}
-            return Err(Box::new(E));
+            return Err(Error::Reception);
         }
-        println!("{_res:?}");
-        create_dir_all(&target_dir).await.unwrap();
-        println!("created dir {target_dir:?}");
+        create_dir_all(&target_dir).await?;
+        println!(
+            "[receiver] Writing received files to `{}`",
+            target_dir.display()
+        );
 
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(8)
-            .build()
-            .unwrap();
+        let listener = TcpListener::bind(format!("0.0.0.0:{}", port))?;
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build()?;
         pool.scope(|s| {
             while let Ok((stream, _socket_addr)) = listener.accept() {
                 let target_dir = target_dir.clone();
@@ -299,46 +285,15 @@ fn receive(
             }
         });
         Ok(())
-    });
-    Ok(())
+    })
 }
 
-unsafe impl Send for ProcessErr {}
-unsafe impl Sync for ProcessErr {}
-
-#[derive(Debug)]
-enum ProcessErr {
-    Io(std::io::Error),
-    Utf8(std::str::Utf8Error),
-}
-impl std::fmt::Display for ProcessErr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "{}", err),
-            Self::Utf8(err) => write!(f, "{}", err),
-        }
-    }
-}
-impl serde::ser::StdError for ProcessErr {}
-impl From<std::io::Error> for ProcessErr {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-impl From<std::str::Utf8Error> for ProcessErr {
-    fn from(e: std::str::Utf8Error) -> Self {
-        Self::Utf8(e)
-    }
-}
-fn process(
-    mut stream: TcpStream,
-    mut path: PathBuf,
-    buf_size: usize,
-) -> std::result::Result<(), ProcessErr> {
+/// Process a single file being received.
+fn process(mut stream: TcpStream, mut path: PathBuf, buf_size: usize) -> Result<()> {
     let mut contents = vec![0; if buf_size == 0 { 102400000 } else { buf_size }];
     let n = stream.read(&mut contents)?;
     if n == 0 {
-        println!("username and path missing?");
+        println!("[receiver] `username` and `path` missing?");
         return Ok(());
     }
     let header = std::str::from_utf8(&contents[..n])?.to_string();
@@ -346,23 +301,22 @@ fn process(
     let (username, file_len, file_name) = match &header[..] {
         [username, file_len, file_name] => {
             let file_len: std::result::Result<usize, _> = file_len.parse();
-            (username, file_len.unwrap(), file_name)
+            (username, file_len?, file_name)
         }
         _ => panic!(),
     };
-    println!("incoming file `{file_name}` from `{username}` with len {file_len}");
+    println!("[receiver] Incoming file `{file_name}` from `{username}` with len {file_len}");
     let _bytes_written = stream.write(&[1])?;
 
     if file_name.contains('/') {
         let mut path = path.clone();
         path.push(file_name.rsplit_once('/').unwrap().0);
-        println!("{:?}", path);
-        std::fs::create_dir_all(path).unwrap();
+        std::fs::create_dir_all(path)?;
     }
     path.push(file_name);
 
     // If the file already exists we overwrite it.
-    println!("writing to {:?}", path.display());
+    println!("[receiver] Writing `{}`", path.display());
     let mut file = File::create(&path)?;
     let mut total = 0;
     let mut consecutive_zeros = 0;
@@ -382,7 +336,12 @@ fn process(
             consecutive_zeros += 1;
         }
     }
-    println!("total {} of {}", total, file_len);
+    println!(
+        "[receiver] Wrote total {} of {} to `{}`",
+        total,
+        file_len,
+        path.display()
+    );
     Ok(())
 }
 
@@ -408,8 +367,8 @@ struct Mapping {
     port: u32,
 }
 
-fn registry(reg: &str) -> std::result::Result<(), std::net::AddrParseError> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+fn registry(reg: &str) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let state = S::default();
 
@@ -431,15 +390,104 @@ fn registry(reg: &str) -> std::result::Result<(), std::net::AddrParseError> {
                     let ip_addr = addr.unwrap().ip();
                     let target_addr = format!("{ip_addr}:{port}");
                     let r = format!("Registering \"{username}\" at {target_addr} from {addr:?}");
-                    println!("{r}");
+                    println!("[registry] {r}");
                     state.lock().unwrap().insert(username, target_addr);
                     r
                 }
             });
         let routes = register.or(root);
-        println!("starting registry listening at `{reg}`");
+        println!("[registry] Starting registry listening at `{reg}`");
         let reg: std::net::SocketAddr = reg.parse()?;
         warp::serve(routes).run(reg).await;
         Ok(())
     })
+}
+
+#[derive(Debug)]
+enum Error {
+    Io(std::io::Error),
+    Utf8(std::str::Utf8Error),
+    InvalidUri(http::uri::InvalidUri),
+    AddrParseError(std::net::AddrParseError),
+    Any(Box<dyn std::error::Error + Send + Sync>),
+    Reception,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "{}", err),
+            Self::Utf8(err) => write!(f, "{}", err),
+            Self::InvalidUri(err) => write!(f, "{}", err),
+            Self::AddrParseError(err) => write!(f, "{}", err),
+            Self::Any(err) => write!(f, "{}", err),
+            Self::Reception => write!(f, "couldn't receive file"),
+        }
+    }
+}
+
+unsafe impl Send for Error {}
+unsafe impl Sync for Error {}
+
+impl std::error::Error for Error {}
+
+impl From<Box<dyn std::error::Error + Send + Sync>> for Error {
+    fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::Any(e)
+    }
+}
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+impl From<std::str::Utf8Error> for Error {
+    fn from(e: std::str::Utf8Error) -> Self {
+        Self::Utf8(e)
+    }
+}
+impl From<std::net::AddrParseError> for Error {
+    fn from(e: std::net::AddrParseError) -> Self {
+        Self::AddrParseError(e)
+    }
+}
+impl From<http::Error> for Error {
+    fn from(e: http::Error) -> Self {
+        Self::Any(Box::new(e))
+    }
+}
+impl From<http::uri::InvalidUri> for Error {
+    fn from(e: http::uri::InvalidUri) -> Self {
+        Self::InvalidUri(e)
+    }
+}
+impl<T: Send + Sync + 'static> From<std::sync::PoisonError<T>> for Error {
+    fn from(e: std::sync::PoisonError<T>) -> Self {
+        Self::Any(Box::new(e))
+    }
+}
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Any(Box::new(e))
+    }
+}
+impl From<glob::PatternError> for Error {
+    fn from(e: glob::PatternError) -> Self {
+        Self::Any(Box::new(e))
+    }
+}
+impl From<std::num::ParseIntError> for Error {
+    fn from(e: std::num::ParseIntError) -> Self {
+        Self::Any(Box::new(e))
+    }
+}
+impl From<ThreadPoolBuildError> for Error {
+    fn from(e: ThreadPoolBuildError) -> Self {
+        Self::Any(Box::new(e))
+    }
+}
+impl From<hyper::Error> for Error {
+    fn from(e: hyper::Error) -> Self {
+        Self::Any(Box::new(e))
+    }
 }
